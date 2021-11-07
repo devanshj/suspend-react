@@ -1,101 +1,132 @@
-type Tuple<T = any> = [T] | T[]
-type Await<T> = T extends Promise<infer V> ? V : never
-type Config = { lifespan?: number; equal?: (a: any, b: any) => boolean }
-type Cache<Keys extends Tuple<unknown>> = {
-  promise: Promise<unknown>
-  keys: Keys
-  equal?: (a: any, b: any) => boolean
-  error?: any
-  response?: unknown
-}
+import { Map, pipe, Time, Fn, Arr, O, assertNever, isPromise } from "./extras"
 
-function shallowEqualArrays(
-  arrA: any[],
-  arrB: any[],
-  equal: (a: any, b: any) => boolean = (a: any, b: any) => a === b
-) {
-  if (arrA === arrB) return true
-  if (!arrA || !arrB) return false
-  const len = arrA.length
-  if (arrB.length !== len) return false
-  for (let i = 0; i < len; i++) if (!equal(arrA[i], arrB[i])) return false
-  return true
-}
+const cache =
+  Map.create() as Cache
 
-const globalCache: Cache<Tuple<unknown>>[] = []
+const suspendImpl: SuspendImpl = (resolver, key, options) => {
+  let cacheValue = pipe(cache, Map.get(key))
+  if (cacheValue) {
+    if (cacheValue.status === "PENDING") throw cacheValue.promise
+    if (cacheValue.status === "FULFILLED") return cacheValue.value
+    if (cacheValue.status === "REJECTED") throw cacheValue.error
+    assertNever(cacheValue)
+  }
+  
+  let newCacheValue: CacheValue = {
+    key,
+    status: "PENDING",
+    promise: pipe(resolver, Fn.apply(key)),
+    equal: options?.equal ?? Arr.shallowEqual,
+    lifespan: options?.lifespan,
+  }
 
-function query<Keys extends Tuple<unknown>, Fn extends (...keys: Keys) => Promise<unknown>>(
-  fn: Fn,
-  keys: Keys,
-  preload = false,
-  config: Partial<Config> = {}
-) {
-  for (const entry of globalCache) {
-    // Find a match
-    if (shallowEqualArrays(keys, entry.keys, entry.equal)) {
-      // If we're pre-loading and the element is present, just return
-      if (preload) return undefined as unknown as Await<ReturnType<Fn>>
-      // If an error occurred, throw
-      if (Object.prototype.hasOwnProperty.call(entry, 'error')) throw entry.error
-      // If a response was successful, return
-      if (Object.prototype.hasOwnProperty.call(entry, 'response')) return entry.response as Await<ReturnType<Fn>>
-      // If the promise is still unresolved, throw
-      if (!preload) throw entry.promise
+  pipe(cache, Map.add(newCacheValue as CacheValue));
+
+  newCacheValue.promise.then(value => {
+    pipe(newCacheValue, O.replace({
+      ...newCacheValue,
+      status: "FULFILLED",
+      value,
+    }))
+
+    if (newCacheValue.lifespan) {
+      Time.setTimeout(() => {
+        pipe(cache, Map.remove(newCacheValue.key))
+      }, newCacheValue.lifespan)
     }
-  }
+  })
 
-  // The request is new or has changed.
-  const entry: Cache<Keys> = {
-    keys,
-    equal: config.equal,
-    promise:
-      // Execute the promise
-      fn(...keys)
-        // When it resolves, store its value
-        .then((response) => (entry.response = response))
-        // Remove the entry if a lifespan was given
-        .then(() => {
-          if (config.lifespan && config.lifespan > 0) {
-            setTimeout(() => {
-              const index = globalCache.indexOf(entry)
-              if (index !== -1) globalCache.splice(index, 1)
-            }, config.lifespan)
-          }
-        })
-        // Store caught errors, they will be thrown in the render-phase to bubble into an error-bound
-        .catch((error) => (entry.error = error)),
-  }
-  // Register the entry
-  globalCache.push(entry)
-  // And throw the promise, this yields control back to React
-  if (!preload) throw entry.promise
-  return undefined as unknown as Await<ReturnType<Fn>>
+  newCacheValue.promise.catch((error: CacheRejectedError) => {
+    pipe(newCacheValue, O.replace({
+      ...newCacheValue,
+      status: "REJECTED",
+      error,
+    }))
+  })
+
+  return suspendImpl(resolver, key, options);
 }
+export const suspend = suspendImpl as Suspend;
 
-const suspend = <Keys extends Tuple<unknown>, Fn extends (...keys: Keys) => Promise<unknown>>(
-  fn: Fn,
-  keys: Keys,
-  config?: Config
-) => query(fn, keys, false, config)
+const preloadImpl: PreloadImpl = (...a) => {
+  try {
+    suspendImpl(...a);
+  } catch (e) {
+    if (isPromise(e)) return
+    throw e
+  }
+}
+export const preload = preloadImpl as Preload;
 
-const preload = <Keys extends Tuple<unknown>, Fn extends (...keys: Keys) => Promise<unknown>>(
-  fn: Fn,
-  keys: Keys,
-  config?: Config
-) => void query(fn, keys, true, config)
+const clearImpl: ClearImpl = key => {
+  if (key === undefined) {
+    pipe(cache, Map.removeAll)
+    return;
+  }
+  pipe(cache, Map.remove(key))
+}
+export const clear = clearImpl as Clear
 
-const peek = <Keys extends Tuple<unknown>>(keys: Keys) =>
-  globalCache.find((entry) => shallowEqualArrays(keys, entry.keys, entry.equal))?.response
+const peekImpl: PeekImpl = key => pipe(cache, Map.get(key))
+export const peek = peekImpl as Peek;
 
-const clear = <Keys extends Tuple<unknown>>(keys?: Keys) => {
-  if (keys === undefined || keys.length === 0) globalCache.splice(0, globalCache.length)
-  else {
-    const entry = globalCache.find((entry) => shallowEqualArrays(keys, entry.keys, entry.equal))
-    if (entry) {
-      const index = globalCache.indexOf(entry)
-      if (index !== -1) globalCache.splice(index, 1)
+type Cache = Map<CacheKey, CacheValue>;
+type CacheKey = unknown[] & { __CacheKey: void }
+type CacheValue =
+  & ( { status: "PENDING", promise: Promise<CacheFulfilledValue> }
+    | { status: "FULFILLED", value: CacheFulfilledValue }
+    | { status: "REJECTED", error: CacheRejectedError }
+    )
+  & { key: CacheKey
+    , equal: (a: CacheKey, b: CacheKey) => boolean
+    , lifespan: Time.Duration | undefined
     }
-  }
-}
 
-export { suspend, clear, preload, peek }
+type CacheFulfilledValue = {} & { __CacheFulfilledValue: void }
+type CacheRejectedError = {} & { __CacheError: void }
+
+export interface Types {}
+type Key =
+  Types extends { key: unknown[] }
+    ? Types["key"]
+    : unknown[];
+
+type Suspend =
+  <R extends (...key: K) => Promise<unknown>, K extends Key>
+    (resolver: R, key: K, options?: SuspendOptions<K>) =>
+      R extends () => Promise<infer T> ? T : never
+
+type SuspendImpl = 
+  ( resolver: (...key: CacheKey) => Promise<CacheFulfilledValue>
+  , key: CacheKey
+  , options?: SuspendOptionsImpl
+  ) =>
+    CacheFulfilledValue
+
+interface SuspendOptions<K extends Key>
+  { equal?: (a: K, b: K) => boolean
+  , lifespan?: number
+  }
+
+interface SuspendOptionsImpl
+  { equal?: (a: CacheKey, b: CacheKey) => boolean
+  , lifespan?: Time.Duration
+  }
+
+type Preload =
+  <R extends (...key: K) => Promise<unknown>, K extends Key>
+    (resolver: R, key: K, options?: SuspendOptions<K>) =>
+      void
+
+type PreloadImpl = 
+  ( resolver: (...key: CacheKey) => Promise<CacheFulfilledValue>
+  , key: CacheKey
+  , options?: SuspendOptionsImpl
+  ) =>
+    void
+
+type Clear = (key?: Key) => void
+type ClearImpl = (key?: CacheKey) => void
+
+type Peek = (key: Key) => void
+type PeekImpl = (key: CacheKey) => void
