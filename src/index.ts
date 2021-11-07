@@ -67,7 +67,14 @@ const clearImpl: ClearImpl = key => {
 }
 export const clear = clearImpl as Clear
 
-const peekImpl: PeekImpl = key => pipe(cache, Map.get(key))
+const peekImpl: PeekImpl = key => {
+  let cacheValue = pipe(cache, Map.get(key))
+  return (
+    cacheValue?.status === "FULFILLED"
+      ? cacheValue.value
+      : undefined
+  )
+}
 export const peek = peekImpl as Peek;
 
 type Cache = Map<CacheKey, CacheValue>;
@@ -86,13 +93,25 @@ type CacheFulfilledValue = {} & { __CacheFulfilledValue: void }
 type CacheRejectedError = {} & { __CacheError: void }
 
 export interface Types {}
-type Key =
-  Types extends { key: unknown[] }
-    ? Types["key"]
-    : unknown[];
+
+type UnknownMap = [unknown[], unknown][]
+type TMap = 
+  Types extends { map: UnknownMap }
+    ? Types["map"]
+    : UnknownMap;
+
+type Key = TMap[number][0]
+
+type Value<K> =
+  { [I in keyof TMap]:
+      TMap[I] extends [infer Tk, infer Tv]
+        ? Tk extends K ? Tv : never
+        : never
+  }[keyof TMap] 
+
 
 type Suspend =
-  <R extends (...key: K) => Promise<unknown>, K extends Key>
+  <R extends (...key: K) => Promise<Value<K>>, K extends Key>
     (resolver: R, key: K, options?: SuspendOptions<K>) =>
       R extends () => Promise<infer T> ? T : never
 
@@ -114,7 +133,7 @@ interface SuspendOptionsImpl
   }
 
 type Preload =
-  <R extends (...key: K) => Promise<unknown>, K extends Key>
+  <R extends (...key: K) => Promise<Value<K>>, K extends Key>
     (resolver: R, key: K, options?: SuspendOptions<K>) =>
       void
 
@@ -128,5 +147,5 @@ type PreloadImpl =
 type Clear = (key?: Key) => void
 type ClearImpl = (key?: CacheKey) => void
 
-type Peek = (key: Key) => void
-type PeekImpl = (key: CacheKey) => void
+type Peek = <K extends Key>(key: K) => Value<K> | undefined
+type PeekImpl = (key: CacheKey) => CacheFulfilledValue | undefined
